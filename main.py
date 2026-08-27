@@ -21,13 +21,28 @@ HF_INDEX_BASE = os.environ.get(
 INDEX_SOURCE = os.environ.get("ICMR_INDEX_SOURCE", "remote").lower()
 PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
 THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
-DUPLICATE_CAP = 2
+DUPLICATE_CAP = 1
 
 SEARCH_FIELDS = [
     "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
     "address", "district", "pincode", "state", "town", "source",
 ]
 NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
+
+TG_HF_INDEX_BASE = os.environ.get(
+    "TG_HF_INDEX_BASE",
+    "https://huggingface.co/datasets/Kzr0xx/telegram/resolve/main",
+).rstrip("/")
+
+TELEGRAM_URLS = [
+    f"{TG_HF_INDEX_BASE}/TGDATA%20BY%20DEADLOX%20P{i}.parquet"
+    for i in range(1, 5)
+]
+
+TELEGRAM_FIELDS = [
+    "user_id", "username", "first_name", "last_name", "phone", "email",
+    "status", "linked_id", "linked_name", "linked_handle",
+]
 
 IDX_PHONE = "idx_phone"
 IDX_AADHAR = "idx_aadhar"
@@ -45,6 +60,8 @@ pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
 
 
 def _idx_ready(kind: str) -> bool:
+    if kind == "telegram":
+        return True
     return kind in REMOTE_INDEXES
 
 
@@ -60,6 +77,8 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
         view = f"people_{kind}"
         lst = ", ".join(f"'{u}'" for u in urls)
         con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM read_parquet([{lst}])")
+    tg_lst = ", ".join(f"'{u}'" for u in TELEGRAM_URLS)
+    con.execute(f"CREATE OR REPLACE VIEW tg AS SELECT * FROM read_parquet([{tg_lst}])")
     con.execute(f"SET threads = {THREADS_PER_CONN}")
     return con
 
@@ -83,6 +102,9 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
 
 # ── Dedup & Connected Records ───────────────────────────────────────────────
 def _person_key(row: dict) -> tuple:
+    uid = row.get("user_id")
+    if uid not in (None, ""):
+        return ("tg", str(uid))
     ph = (row.get("phoneNumber") or "").strip()
     ad = (row.get("aadharNumber") or "").strip()
     if ph or ad:
@@ -151,6 +173,22 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
 
 
+def _run_telegram_search(field: str, value: str, mode: str, limit: int) -> dict:
+    if field not in TELEGRAM_FIELDS:
+        raise ValueError(f"Unknown field: {field}")
+    v = value.replace("'", "''")
+    if mode == "exact":
+        sql = f"SELECT * FROM tg WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
+    else:  # contains
+        v2 = v.replace("%", r"\%").replace("_", r"\_")
+        sql = f"SELECT * FROM tg WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
+    con = _get_conn()
+    rows = con.execute(sql).fetchall()
+    cols = [d[0] for d in con.description]
+    results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
+    return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
+
+
 def _unified_search(q: str, limit: int = 10) -> dict:
     q = q.strip()
     is_num = q.isdigit() and len(q) >= 8
@@ -168,13 +206,23 @@ def _unified_search(q: str, limit: int = 10) -> dict:
             r = _run_field_search("aadharNumber", q, "exact", limit)
             all_rows.extend(r["results"])
             searched.append("aadharNumber")
+        # Telegram user_id fallback
+        if not all_rows:
+            r = _run_telegram_search("user_id", q, "exact", limit)
+            all_rows.extend(r["results"])
+            searched.append("user_id")
         all_rows = _cap_duplicates(all_rows)[:limit]
         return {
             "query": q, "searched_fields": searched,
             "count": len(all_rows), "results": all_rows,
         }
     else:
-        return {"query": q, "searched_fields": [], "count": 0, "results": []}
+        # Telegram username search
+        r = _run_telegram_search("username", q, "contains", limit)
+        return {
+            "query": q, "searched_fields": ["username"],
+            "count": len(r["results"]), "results": r["results"],
+        }
 
 
 # ── FastAPI (for API access) ────────────────────────────────────────────────
@@ -191,9 +239,12 @@ def root():
     return {
         "app": "ICMR + HITEK Search API",
         "records": 2_504_793_870,
-        "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
+        "telegram_records": 1_899_021_651,
+        "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar"),
+                    "telegram": _idx_ready("telegram")},
         "index_source": INDEX_SOURCE,
         "columns": SEARCH_FIELDS,
+        "telegram_columns": TELEGRAM_FIELDS,
         "docs": "/docs",
         "developer": "@n1lux| channel @n1luxlabs",   # <-- credit added
     }
@@ -202,7 +253,8 @@ def root():
 @fastapi_app.get("/health")
 def health():
     return {"status": "ok", "raw_database_required": False,
-            "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
+            "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar"),
+                        "telegram": _idx_ready("telegram")},
             "index_source": INDEX_SOURCE}
 
 
@@ -220,7 +272,10 @@ async def search(
         raise HTTPException(422, "Provide q or mobile")
     loop = asyncio.get_running_loop()
     if field:
-        data = await loop.run_in_executor(pool, _run_field_search, field, q_val, mode, limit)
+        if field in TELEGRAM_FIELDS:
+            data = await loop.run_in_executor(pool, _run_telegram_search, field, q_val, mode, limit)
+        else:
+            data = await loop.run_in_executor(pool, _run_field_search, field, q_val, mode, limit)
     else:
         data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
     result = {"success": bool(data["count"]), **data, "number": q_val,
@@ -277,7 +332,7 @@ async def startup_event():
 def format_result(row: dict) -> str:
     """Format a single result record as readable text."""
     lines = []
-    for field in SEARCH_FIELDS:
+    for field in SEARCH_FIELDS + TELEGRAM_FIELDS:
         val = row.get(field, "")
         if val:
             lines.append(f"**{field}:** {val}")
@@ -324,8 +379,8 @@ def build_ui():
         .footer { text-align: center; color: #888; margin-top: 20px; }
         """
     ) as demo:
-        gr.Markdown("# 🔍 ICMR + HITEK Search API", elem_classes="main-title")
-        gr.Markdown("Search **2.5 billion records** — phone, Aadhaar, name, address & more", elem_classes="subtitle")
+        gr.Markdown("# 🔍 ICMR + HITEK + Telegram Search API", elem_classes="main-title")
+        gr.Markdown("Search **billions of records** — phone, Aadhaar, Telegram username/user_id, name & more", elem_classes="subtitle")
 
         with gr.Row():
             with gr.Column(scale=3):
@@ -358,12 +413,16 @@ def build_ui():
         with gr.Accordion("📡 API Info", open=False):
             gr.Markdown("""
 **Endpoints** (via FastAPI):
-- `GET /search?q=<number>` — Phone/Aadhaar search
-- `GET /search?mobile=<number>` — Phone search (alias)
+- `GET /search?q=<username_or_number>` — Phone/Aadhaar/Telegram search
+- `GET /search?field=username&q=<name>&mode=contains` — Telegram username search
+- `GET /search?field=user_id&q=<id>` — Telegram user_id search
+- `GET /mobile=<number>` — Phone search (alias)
 - `GET /health` — Health check
 - `GET /docs` — Swagger UI
 
-**Source:** [HF Dataset](https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed)
+**Sources:**
+- [ICMR + HITEK](https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed)
+- [Telegram](https://huggingface.co/datasets/Kzr0xx/telegram)
             """)
 
         # Developer credit footer

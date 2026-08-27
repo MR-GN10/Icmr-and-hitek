@@ -1,7 +1,43 @@
 🔍 ICMR + HITEK Search API
 
-A high‑performance search API for 2.5 billion Indian citizen records (ICMR + HITEK data) – featuring phone, Aadhaar, and multi‑field search.
-Built with FastAPI + Gradio + DuckDB, with remote Parquet indexes hosted on HuggingFace.
+A high‑performance search API for billions of Indian records – featuring ICMR + HITEK (phone, Aadhaar, name) and Telegram (username / user_id / phone) lookup. Built with FastAPI + Gradio + DuckDB, with remote Parquet indexes hosted on HuggingFace.
+
+---
+
+🚀 Installation
+
+**Option 1 – Source install (from GitHub)**
+
+```bash
+git clone https://github.com/cyber-punk-h/Icmr-and-hitek.git
+cd Icmr-and-hitek
+python -m venv venv
+# Windows
+venv\Scripts\activate
+# Linux/macOS
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+**Option 2 – Direct pip install of dependencies**
+
+```bash
+pip install fastapi gradio duckdb httpx uvicorn pydantic
+```
+
+Or, if a `requirements.txt` is already present, run:
+
+```bash
+pip install -r requirements.txt
+```
+
+Then start the app:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+---
 
 https://img.shields.io/badge/version-1.0-blue
 https://img.shields.io/badge/python-3.9%2B-blue
@@ -12,7 +48,8 @@ https://img.shields.io/badge/Render-ready-success
 📌 Features
 
 · 🔎 Instant search – phone, Aadhaar, name, father’s name, address, district, state, pincode, town, source.
-· ⚡ 2.5 billion records – indexed and queryable via DuckDB over HTTP/Parquet.
+· 💬 Telegram lookup – search by username or user_id (partial/contains allowed for username) → returns first_name, last_name, phone, email, status, linked accounts.
+· ⚡ Billions of records – 2.5B ICMR/HITEK + 1.9B Telegram users, queryable via DuckDB over HTTP/Parquet.
 · 🎯 Exact & contains modes – flexible searching.
 · 📱 Gradio UI – user‑friendly web interface for non‑technical users.
 · 🧩 RESTful API – FastAPI with Swagger docs (/docs).
@@ -31,40 +68,6 @@ https://img.shields.io/badge/Render-ready-success
 · HuggingFace – remote storage for partitioned Parquet indexes
 · Uvicorn – ASGI server
 · httpx – async HTTP client for pinger
-
----
-
-🚀 Quick Start (Local)
-
-1. Clone the repository
-
-```bash
-git clone https://github.com/cyber-punk-h/Icmr-and-hitek.git
-cd Icmr-and-hitek
-```
-
-2. Create a virtual environment (optional but recommended)
-
-```bash
-python -m venv venv
-source venv/bin/activate   # Linux/macOS
-# or
-venv\Scripts\activate      # Windows
-```
-
-3. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-4. Run the application
-
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-The app will be available at http://localhost:8000 – Gradio UI at / and API at /docs.
 
 ---
 
@@ -113,13 +116,22 @@ GET /search?field=aadharNumber&q=123456789012
 GET /search?field=name&q=Rahul&mode=contains
 ```
 
-3. Use mobile alias (same as q)
+3. Telegram search (username / user_id / phone)
+
+```http
+GET /search?field=username&q=umar&mode=contains
+GET /search?field=user_id&q=1899021651
+GET /search?field=phone&q=79899152324
+GET /search?field=first_name&q=Umar&mode=contains
+```
+
+4. Use mobile alias (same as q)
 
 ```http
 GET /search?mobile=9876543210
 ```
 
-4. Batch search (POST)
+5. Batch search (POST)
 
 ```json
 POST /search/parallel
@@ -147,10 +159,10 @@ All search endpoints return JSON with:
 🧠 How It Works
 
 · The app does not store the full raw database locally.
-· It uses remote Parquet indexes hosted on HuggingFace, partitioned into 7 files for phone and 7 for Aadhaar.
+· It uses remote Parquet indexes hosted on HuggingFace, partitioned into 7 files for phone and 7 for Aadhaar; Telegram uses 4 Parquet parts (TGDATA BY DEADLOX P1–P4).
 · DuckDB reads these indexes directly over HTTP (via httpfs extension) and executes queries efficiently.
-· Search is exact match on indexed fields; contains mode is available for name (but not for other fields in remote mode).
-· Duplicate records are limited to 2 per person (configurable via DUPLICATE_CAP) to avoid overwhelming results.
+· ICMR/HITEK search is exact match on indexed fields; Telegram supports exact & contains (partial) search on username, user_id, phone, first_name, etc.
+· Duplicate records are collapsed to 1 per person (DUPLICATE_CAP) to avoid repeated identical results.
 
 ---
 
@@ -168,7 +180,8 @@ Example: https://yourapp.onrender.com/health
 🛠 Environment Variables
 
 Variable Default Description
-ICMR_HF_INDEX_BASE https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed/resolve/main Base URL for remote Parquet indexes.
+ICMR_HF_INDEX_BASE https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed/resolve/main Base URL for ICMR/HITEK remote Parquet indexes.
+TG_HF_INDEX_BASE https://huggingface.co/datasets/Kzr0xx/telegram/resolve/main Base URL for Telegram remote Parquet files.
 ICMR_INDEX_SOURCE remote (Future use) – currently only remote is supported.
 ICMR_PARALLEL 2 Number of parallel workers for search requests.
 ICMR_THREADS_PER_CONN 2 DuckDB threads per connection.
